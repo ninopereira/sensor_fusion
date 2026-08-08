@@ -2,6 +2,11 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
 
 class OdometrySensor {
 public:
@@ -60,7 +65,8 @@ public:
         The Kalman filter will be initialized with these parameters.
         */
     Robot(const Vec& initial_state, const ImuSensor& imu_sensor, const OdometrySensor& odom_sensor)
-        : state_(initial_state), kf_(BuildKalmanFilter(imu_sensor, odom_sensor, initial_state))
+        : state_(initial_state), kf_(BuildKalmanFilter(imu_sensor, odom_sensor, initial_state)),
+          odom_position_(initial_state.head(2))
     {
     }
 
@@ -75,11 +81,17 @@ public:
 
     /**
      * Update the robot's state with new odometry data.
-     * @param odom_data position measurements [x, y]
+     * The filter's measurement model corrects absolute position, but wheel odometry naturally
+     * reports incremental displacement since the previous reading. Robot (not the caller, and
+     * not the generic KalmanFilter) owns that distinction: it accumulates the deltas into a
+     * running world-frame position estimate and feeds that to the filter.
+     * @param odom_delta incremental world-frame displacement since the previous odometry
+     *                   reading [dx, dy], in meters
      */
-    void UpdateOdometry(const Vec& odom_data)
+    void UpdateOdometry(const Vec& odom_delta)
     {
-        kf_.update(odom_data);
+        odom_position_ += odom_delta;
+        kf_.update(odom_position_);
     }
 
     /**
@@ -146,7 +158,72 @@ private:
 
     Vec state_; // State vector [x, y, vel_x, vel_y]
     KalmanFilter kf_; // Kalman filter instance
+    Vec odom_position_; // running world-frame position accumulated from odometry deltas
 };
+
+struct ImuSample {
+    double t;   ///< timestamp in seconds
+    double ax;  ///< x acceleration in m/s^2
+    double ay;  ///< y acceleration in m/s^2
+    // gz (yaw rate) is present in the CSV but unused: this filter has no orientation state.
+};
+
+struct OdomSample {
+    double t;   ///< timestamp in seconds
+    double dx;  ///< x displacement since the previous odometry reading, in meters
+    double dy;  ///< y displacement since the previous odometry reading, in meters
+};
+
+// Split a CSV line into its comma-separated fields.
+static std::vector<std::string> SplitCsvLine(const std::string& line)
+{
+    std::vector<std::string> fields;
+    std::stringstream ss(line);
+    std::string field;
+    while (std::getline(ss, field, ',')) {
+        fields.push_back(field);
+    }
+    return fields;
+}
+
+// Open path or print an error and terminate.
+static std::ifstream OpenCsvOrDie(const std::string& path)
+{
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "error: could not open " << path << "\n";
+        std::exit(EXIT_FAILURE);
+    }
+    return file;
+}
+
+static std::vector<ImuSample> ReadImuCsv(const std::string& path)
+{
+    std::ifstream file = OpenCsvOrDie(path);
+
+    std::vector<ImuSample> samples;
+    std::string line;
+    std::getline(file, line); // discard header (t_s,ax_mps2,ay_mps2,gz_radps)
+    while (std::getline(file, line)) {
+        const auto fields = SplitCsvLine(line);
+        samples.push_back(ImuSample{std::stod(fields[0]), std::stod(fields[1]), std::stod(fields[2])});
+    }
+    return samples;
+}
+
+static std::vector<OdomSample> ReadOdomCsv(const std::string& path)
+{
+    std::ifstream file = OpenCsvOrDie(path);
+
+    std::vector<OdomSample> samples;
+    std::string line;
+    std::getline(file, line); // discard header (t_s,dx_m,dy_m)
+    while (std::getline(file, line)) {
+        const auto fields = SplitCsvLine(line);
+        samples.push_back(OdomSample{std::stod(fields[0]), std::stod(fields[1]), std::stod(fields[2])});
+    }
+    return samples;
+}
 
 int main()
 {
@@ -157,9 +234,32 @@ int main()
     // define a robot with initial state [x, y, vel_x, vel_y], IMU, and odometry sensors
     auto wheelies = Robot(Vec::Zero(4), imu, odom);
 
-    wheelies.UpdateIMU(Vec::Zero(2)); // Simulate an IMU update with zero acceleration [ax, ay]
+    const std::vector<ImuSample> imu_samples = ReadImuCsv("data/imu_readings.csv");
+    const std::vector<OdomSample> odom_samples = ReadOdomCsv("data/odom_readings.csv");
 
-    // Note: we assume the odometry reading here is already processed to give the displacement in the world frame,
-    // and that the robot's orientation is known.
-    wheelies.UpdateOdometry(Vec::Zero(2)); // Simulate an odometry update
+    // Walk both sample streams in timestamp order, feeding each reading to the filter at the
+    // moment it actually occurred, rather than assuming a fixed IMU-tick/odometry-tick ratio.
+    std::size_t i = 0;
+    std::size_t j = 0;
+    while (i < imu_samples.size() || j < odom_samples.size()) {
+        const bool take_imu = (j >= odom_samples.size()) ||
+                               (i < imu_samples.size() && imu_samples[i].t <= odom_samples[j].t);
+        if (take_imu) {
+            const ImuSample& s = imu_samples[i];
+            Vec u(2);
+            u << s.ax, s.ay;
+            wheelies.UpdateIMU(u);
+            ++i;
+        } else {
+            const OdomSample& s = odom_samples[j];
+            Vec delta(2);
+            delta << s.dx, s.dy;
+            wheelies.UpdateOdometry(delta);
+            ++j;
+
+            const Vec& state = wheelies.GetState();
+            std::cout << "t=" << s.t << "s  x=" << state(0) << "  y=" << state(1)
+                      << "  vx=" << state(2) << "  vy=" << state(3) << "\n";
+        }
+    }
 }

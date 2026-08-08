@@ -20,11 +20,28 @@ A Kalman filter can fuse IMU and wheel odometry to estimate:
 
 ## Build instructions
 
-Compile with:
+Requires the Eigen3 headers (`libeigen3-dev` on Debian/Ubuntu). Compile with:
 
 ```bash
-g++ -std=c++17 -I/usr/include/eigen3 main.cpp
+g++ -std=c++17 -I/usr/include/eigen3 -Wall -Wextra -O2 main.cpp -o sensor_fusion
 ```
+
+## Running the simulation
+
+`main()` reads two CSV files of synthetic sensor data and drives the filter through them in
+timestamp order. Generate the data, then run the binary from the repo root (it opens
+`data/imu_readings.csv` and `data/odom_readings.csv` via relative paths):
+
+```bash
+python3 generate_sensor_data.py   # writes data/imu_readings.csv, data/odom_readings.csv, data/ground_truth.csv
+./sensor_fusion
+```
+
+`generate_sensor_data.py` needs only the Python 3 standard library (no pip install). It
+simulates a short trajectory (accelerate, turn, cruise, decelerate) and writes noisy IMU/odometry
+readings plus a `ground_truth.csv` of the true state, so the filter's printed output (state
+estimate at each odometry update) can be checked against ground truth. See the script's docstring
+for the exact motion profile and noise model.
 
 ## Kalman filter structure
 
