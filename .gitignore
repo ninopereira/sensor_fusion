@@ -1,0 +1,10 @@
+# build artifacts
+sensor_fusion
+*.o
+*.obj
+*.out
+a.out
+
+# Python
+__pycache__/
+*.pyc
