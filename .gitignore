@@ -5,6 +5,9 @@ sensor_fusion
 *.out
 a.out
 
+# generated plots
+trajectory_plot.png
+
 # Python
 __pycache__/
 *.pyc
