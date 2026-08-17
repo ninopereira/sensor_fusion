@@ -65,8 +65,7 @@ public:
         The Kalman filter will be initialized with these parameters.
         */
     Robot(const Vec& initial_state, const ImuSensor& imu_sensor, const OdometrySensor& odom_sensor)
-        : state_(initial_state), kf_(BuildKalmanFilter(imu_sensor, odom_sensor, initial_state)),
-          odom_position_(initial_state.head(2))
+        : state_(initial_state), kf_(BuildKalmanFilter(imu_sensor, odom_sensor, initial_state))
     {
     }
 
@@ -81,17 +80,15 @@ public:
 
     /**
      * Update the robot's state with new odometry data.
-     * The filter's measurement model corrects absolute position, but wheel odometry naturally
-     * reports incremental displacement since the previous reading. Robot (not the caller, and
-     * not the generic KalmanFilter) owns that distinction: it accumulates the deltas into a
-     * running world-frame position estimate and feeds that to the filter.
+     * Wheel odometry naturally reports incremental displacement since the previous reading, so
+     * the raw delta is handed straight to the filter, which fuses it against its own last
+     * corrected position estimate rather than an independently-accumulated one.
      * @param odom_delta incremental world-frame displacement since the previous odometry
      *                   reading [dx, dy], in meters
      */
     void UpdateOdometry(const Vec& odom_delta)
     {
-        odom_position_ += odom_delta;
-        kf_.update(odom_position_);
+        kf_.updateDelta(odom_delta);
     }
 
     /**
@@ -158,7 +155,6 @@ private:
 
     Vec state_; // State vector [x, y, vel_x, vel_y]
     KalmanFilter kf_; // Kalman filter instance
-    Vec odom_position_; // running world-frame position accumulated from odometry deltas
 };
 
 struct ImuSample {
