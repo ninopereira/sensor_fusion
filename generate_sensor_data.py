@@ -4,11 +4,13 @@ Generate synthetic IMU, wheel-odometry, and optical-flow sensor readings for tes
 sensor-fusion Kalman filter in main.cpp / kalman_filter.hpp.
 
 Ground truth: a 2D robot on a flat floor, following a unicycle motion model
-(forward speed v, heading theta, yaw rate omega) through four phases:
+(forward speed v, heading theta, yaw rate omega) through four phases (see motion_profile()):
   0-2 s: accelerate straight ahead,    a_tan = 0.5 m/s^2,  omega = 0
   2-4 s: turn left at constant speed,  a_tan = 0,          omega = 0.4 rad/s
   4-6 s: cruise straight on new heading, a_tan = 0,        omega = 0
   6-8 s: decelerate back to rest,      a_tan = -0.5 m/s^2, omega = 0
+With DURATION_S = 5.0 (below), the run stops partway through the cruise phase - the
+decelerate phase never happens. Raise DURATION_S back toward 8.0 to see the full profile.
 
 Four files are written:
   data/imu_readings.csv          - t_s, ax_mps2, ay_mps2, gz_radps  @ 1000 Hz
@@ -124,7 +126,7 @@ acc_noise_density_si = IMU_NOISE_DENSITY_UG_SQRT_HZ * 9.80665 / 1e6  # (m/s^2)/s
 psd = acc_noise_density_si ** 2                                     # (m/s^2)^2 / Hz
 IMU_ACCEL_NOISE_STD = math.sqrt(psd / DT_IMU)                       # m/s^2, per sample
 
-DURATION_S = 8.0
+DURATION_S = 5.0
 
 
 def motion_profile(t: float) -> tuple[float, float]:
