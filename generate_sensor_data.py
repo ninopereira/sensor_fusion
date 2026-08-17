@@ -48,6 +48,15 @@ Noise is generated to match the noise models already used in main.cpp:
     diverges from ground truth. OPTFLOW_POS_NOISE_STD_M is instead odometry's std scaled by
     the update-interval ratio (0.01 m * dt_optflow/dt_odom = 0.001 m), which restores a
     comparable SNR and must stay in sync with OpticalFlowSensor's ctor arg in main.cpp.
+  - All three sensors also carry their own systematic (non-zero-mean) fault on top of that
+    noise: see IMU_ACCEL_BIAS_LOCAL_MPS2, ODOM_DY_BIAS_FRACTION, and OPTFLOW_DY_BIAS_FRACTION
+    below, each independently tunable/disableable. Unlike the noise terms above, none of these
+    are something the corresponding sensor's Q/R in main.cpp models or can correct for - they're
+    there to test how the fused estimate degrades when one or more sources are quietly wrong in
+    a way the filter has no way to detect. The IMU's bias is the most consequential of the three:
+    it corrupts the process model (predict()) that ALL SensorModes rely on (main.cpp always
+    predicts with IMU, regardless of which correction sources are enabled), whereas the odometry
+    and optical-flow biases only affect their own correction step.
 """
 
 import csv
@@ -66,6 +75,43 @@ ODOM_POS_NOISE_STD_M = 0.01
 OPTFLOW_FREQ_HZ = 100.0
 OPTFLOW_POS_NOISE_STD_M = 0.001
 GYRO_NOISE_STD_RADPS = 0.01  # plausible low-cost MEMS gyro noise; not modeled by ImuSensor yet
+
+# --- systematic sensor faults (bias, not noise) - each independently tunable, 0/0.0 disables it ---
+#
+# IMU accelerometer bias: a constant offset in the accelerometer's own LOCAL/body frame
+# (forward = local x, lateral = local y), e.g. sensor-mounting misalignment or thermal drift -
+# real MEMS accelerometers commonly have bias instability on this order. Applied to the true
+# local (a_tan, v*omega) acceleration before rotating into the world-frame ax/ay this generator
+# reports (see "Frame conventions" above), so - like the odometry/optical-flow biases below -
+# it rotates with the robot rather than pointing a fixed way in world coordinates. This is the
+# most damaging of the three faults: predict() double-integrates it (bias -> velocity error
+# growing linearly, position error growing quadratically) every single IMU tick, in every
+# SensorMode, including modes with no corrections at all to pull the estimate back.
+IMU_ACCEL_BIAS_LOCAL_MPS2 = (0.01, 0.005)  # (forward, lateral), m/s^2
+
+# Systematic (non-zero-mean) odometry fault: a classic wheel-calibration/differential-slip
+# error, where each reading's LOCAL (body-frame: forward = local x, lateral = local y) lateral
+# displacement picks up a leak proportional to that same reading's forward displacement -
+# "for every meter driven forward, report also having drifted this many meters sideways" - not
+# random noise. (A straight scale-up of the true local dy barely does anything here: on this
+# trajectory true per-tick local dy is ~0 while straight and only ~2 mm mid-turn, both far
+# below the position noise floor - see the sanity check this constant's design was verified
+# against. Tying the bias to local dx instead, which is never near-zero, is what makes it
+# actually show up.) Because it's applied in the body frame, it rotates with the robot: as
+# theta changes over the trajectory, the same bias points in different WORLD directions, so it
+# shows up as a curving/veering drift that grows with distance traveled, rather than a constant
+# offset. See ODOM_POS_NOISE_STD_M above for the (still zero-mean) noise on top of this bias,
+# and OdometrySensor's R in main.cpp, which only models that zero-mean noise - a Kalman filter
+# has no way to detect or correct a bias its R doesn't account for, so odometry's contribution
+# to the fused estimate is expected to be pulled off in whatever direction this bias points.
+ODOM_DY_BIAS_FRACTION = 0.08
+
+# Same fault, same local-frame leak-into-lateral model, applied to optical flow instead of
+# odometry (see ODOM_DY_BIAS_FRACTION just above for the mechanics/rationale). Kept smaller
+# than odometry's by default since optical flow is otherwise the tight/trusted correction
+# source in this setup - this tests what happens when even the "good" sensor turns out to be
+# quietly wrong too.
+OPTFLOW_DY_BIAS_FRACTION = 0.03
 
 DT_IMU = 1.0 / IMU_FREQ_HZ
 DT_ODOM = 1.0 / ODOM_FREQ_HZ
@@ -109,9 +155,16 @@ def simulate() -> tuple[
     for i in range(n_imu):
         a_tan, omega = motion_profile(t)
 
-        # world-frame linear acceleration the accelerometer would sense: d/dt(v*cos theta, v*sin theta)
-        ax = a_tan * math.cos(theta) - v * omega * math.sin(theta)
-        ay = a_tan * math.sin(theta) + v * omega * math.cos(theta)
+        # true LOCAL (body-frame forward/lateral) acceleration: tangential a_tan plus
+        # centripetal v*omega, i.e. what an accelerometer rigidly mounted on the robot would
+        # sense before any bias. The accelerometer's own constant local-frame bias (see
+        # IMU_ACCEL_BIAS_LOCAL_MPS2 above) is added here, then the (possibly biased) local
+        # reading is rotated into the world-frame ax/ay this generator reports - equivalent to
+        # d/dt(v*cos theta, v*sin theta) when the bias is (0, 0).
+        local_ax = a_tan + IMU_ACCEL_BIAS_LOCAL_MPS2[0]
+        local_ay = v * omega + IMU_ACCEL_BIAS_LOCAL_MPS2[1]
+        ax = local_ax * math.cos(theta) - local_ay * math.sin(theta)
+        ay = local_ax * math.sin(theta) + local_ay * math.cos(theta)
         meas_ax = ax + random.gauss(0.0, IMU_ACCEL_NOISE_STD)
         meas_ay = ay + random.gauss(0.0, IMU_ACCEL_NOISE_STD)
         meas_gz = omega + random.gauss(0.0, GYRO_NOISE_STD_RADPS)
@@ -130,19 +183,40 @@ def simulate() -> tuple[
             optflow_true.append((t, x, y, theta, v))
 
     def deltas_from_truth(
-        truth: list[tuple[float, float, float, float, float]], noise_std: float
+        truth: list[tuple[float, float, float, float, float]],
+        noise_std: float,
+        local_dy_bias_fraction: float = 0.0,
     ) -> list[tuple[float, float, float]]:
+        """World-frame (dx, dy) readings between consecutive truth samples.
+
+        Each reading is the true world-frame displacement, optionally biased (see
+        local_dy_bias_fraction / ODOM_DY_BIAS_FRACTION above), plus zero-mean Gaussian noise
+        applied in world frame (matching how OdometrySensor/OpticalFlowSensor's R is defined
+        in main.cpp - see the noise-model note at the top of this file).
+        """
         rows: list[tuple[float, float, float]] = []
         prev_x, prev_y = 0.0, 0.0
-        for t_sample, cx, cy, _theta, _v in truth:
-            dx = (cx - prev_x) + random.gauss(0.0, noise_std)
-            dy = (cy - prev_y) + random.gauss(0.0, noise_std)
+        for t_sample, cx, cy, theta, _v in truth:
+            true_dx, true_dy = cx - prev_x, cy - prev_y
+            if local_dy_bias_fraction:
+                # World -> local (body) frame: rotate by -theta so local x is "forward" and
+                # local y is "lateral", leak a fraction of the forward reading into the lateral
+                # one, then rotate back to world frame. Doing this in the body frame (rather
+                # than biasing world dy directly) is what makes the bias rotate with the
+                # robot's heading instead of always pointing the same way in world coordinates.
+                local_dx = true_dx * math.cos(theta) + true_dy * math.sin(theta)
+                local_dy = -true_dx * math.sin(theta) + true_dy * math.cos(theta)
+                local_dy += local_dy_bias_fraction * local_dx
+                true_dx = local_dx * math.cos(theta) - local_dy * math.sin(theta)
+                true_dy = local_dx * math.sin(theta) + local_dy * math.cos(theta)
+            dx = true_dx + random.gauss(0.0, noise_std)
+            dy = true_dy + random.gauss(0.0, noise_std)
             rows.append((t_sample, dx, dy))
             prev_x, prev_y = cx, cy
         return rows
 
-    odom_rows = deltas_from_truth(odom_true, ODOM_POS_NOISE_STD_M)
-    optflow_rows = deltas_from_truth(optflow_true, OPTFLOW_POS_NOISE_STD_M)
+    odom_rows = deltas_from_truth(odom_true, ODOM_POS_NOISE_STD_M, ODOM_DY_BIAS_FRACTION)
+    optflow_rows = deltas_from_truth(optflow_true, OPTFLOW_POS_NOISE_STD_M, OPTFLOW_DY_BIAS_FRACTION)
 
     return imu_rows, odom_rows, optflow_rows, odom_true
 
