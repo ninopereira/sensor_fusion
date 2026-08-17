@@ -28,20 +28,32 @@ g++ -std=c++17 -I/usr/include/eigen3 -Wall -Wextra -O2 main.cpp -o sensor_fusion
 
 ## Running the simulation
 
-`main()` reads two CSV files of synthetic sensor data and drives the filter through them in
+`main()` reads three CSV files of synthetic sensor data and drives the filter through them in
 timestamp order. Generate the data, then run the binary from the repo root (it opens
-`data/imu_readings.csv` and `data/odom_readings.csv` via relative paths):
+`data/imu_readings.csv`, `data/odom_readings.csv`, and `data/optical_flow_readings.csv` via
+relative paths):
 
 ```bash
-python3 generate_sensor_data.py   # writes data/imu_readings.csv, data/odom_readings.csv, data/ground_truth.csv
-./sensor_fusion
+python3 generate_sensor_data.py   # writes data/imu_readings.csv, data/odom_readings.csv,
+                                   # data/optical_flow_readings.csv, data/ground_truth.csv
+./sensor_fusion [all|odom|optflow|imu]
 ```
 
 `generate_sensor_data.py` needs only the Python 3 standard library (no pip install). It
-simulates a short trajectory (accelerate, turn, cruise, decelerate) and writes noisy IMU/odometry
-readings plus a `ground_truth.csv` of the true state, so the filter's printed output (state
-estimate at each odometry update) can be checked against ground truth. See the script's docstring
-for the exact motion profile and noise model.
+simulates a short trajectory (accelerate, turn, cruise, decelerate) and writes noisy IMU,
+odometry, and optical-flow readings plus a `ground_truth.csv` of the true state, so the filter's
+printed output can be checked against ground truth. See the script's docstring for the exact
+motion profile and noise model.
+
+`./sensor_fusion` takes an optional mode argument selecting which correction source(s) feed the
+filter (IMU prediction always runs): `all` (default, odometry + optical flow), `odom` or
+`optflow` (one correction source only), or `imu` (pure dead-reckoning, no corrections at all).
+It prints one state estimate per line on a fixed 10 Hz clock (matching `ground_truth.csv`)
+regardless of mode, e.g. `t=0.3s  x=0.068  y=0.013  vx=0.293  vy=0.008`.
+
+`python3 plot_results.py` runs the binary once per mode and plots all four trajectories against
+ground truth (the fused `all` estimate solid/marked, the three single-source baselines
+dashed/faded) plus their position error over time, saving `trajectory_plot.png`.
 
 ## Kalman filter structure
 
